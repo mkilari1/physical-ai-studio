@@ -1,4 +1,5 @@
 import { Tabs } from '@geti-ui/ui';
+import { afterEach, beforeEach, describe, expect, it } from '@rstest/core';
 import { screen } from '@testing-library/react';
 
 import { render } from '../../test-utils/render';
@@ -19,6 +20,23 @@ const renderSidebar = (selectedKey = 'projects') =>
     );
 
 describe('AppSidebar', () => {
+    beforeEach(() => {
+        process.env.PUBLIC_ENABLE_PLUGINS = 'true';
+    });
+
+    afterEach(() => {
+        delete process.env.PUBLIC_ENABLE_PLUGINS;
+    });
+
+    it('renders the logo, linking to the projects page', () => {
+        renderSidebar();
+
+        const logoLink = screen.getByRole('link', { name: /physical ai studio/i });
+
+        expect(logoLink).toBeInTheDocument();
+        expect(logoLink).toHaveAttribute('href', '/projects');
+    });
+
     it('renders all enabled nav item labels', () => {
         renderSidebar();
 
@@ -50,5 +68,12 @@ describe('AppSidebar', () => {
             .forEach((item) => {
                 expect(screen.queryByRole('tab', { name: item.label })).not.toBeInTheDocument();
             });
+    });
+
+    it('hides the Plugins nav item when the plugins feature is disabled', () => {
+        process.env.PUBLIC_ENABLE_PLUGINS = 'false';
+        renderSidebar();
+
+        expect(screen.queryByRole('tab', { name: 'Plugins' })).not.toBeInTheDocument();
     });
 });

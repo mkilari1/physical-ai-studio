@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import json
 import re
 import shutil
 from dataclasses import dataclass
@@ -13,19 +15,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 from uuid import UUID  # noqa: TC003
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
 from loguru import logger
 from physicalai.data.archive_safety import (
     InsufficientDiskSpaceError,
     InvalidArchiveError,
-    SafeZipArchive,
     ZipBombDetectedError,
     check_disk_headroom,
-    flatten_single_root_directory,
 )
-from sse_starlette.sse import EventSourceResponse
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
+from trainer.archive import validate_and_extract
 from trainer.schemas import (
     CancelResponse,
     DatasetTransfer,
@@ -51,6 +53,15 @@ class _ChunkedFileResponse(FileResponse):
     """FileResponse with a larger streaming chunk size for large artifacts."""
 
     chunk_size = _ARTIFACT_CHUNK_SIZE
+
+
+def _parse_metric_value(value: str) -> int | float | str | None:
+    """Match the Studio CSV metric value representation."""
+    try:
+        parsed = float(value)
+        return int(parsed) if parsed.is_integer() else parsed
+    except ValueError:
+        return None if value == "" else value
 
 
 def _manager(request: Request) -> QueueManager:
@@ -173,22 +184,22 @@ def _check_upload_disk_headroom(request: Request, start: int, total: int | None)
         check_disk_headroom(settings.datasets_dir, remaining_bytes, settings.min_free_bytes)
 
 
-def _validate_and_extract(archive_path: Path, target_dir: Path) -> None:
-    """Validate the ZIP and extract it into ``target_dir`` (blocking)."""
-    settings = get_settings()
-    safe = SafeZipArchive(archive_path, max_uncompressed_bytes=settings.max_uncompressed_bytes)
-    safe.validate()
-    target_dir.mkdir(parents=True, exist_ok=True)
-    safe.extract_to(target_dir, min_free_bytes=settings.min_free_bytes)
-    # Tolerate a single wrapping directory in uploaded snapshots.
-    flatten_single_root_directory(target_dir)
-
-
 @router.post("", response_model=SubmitJobResponse, status_code=status.HTTP_202_ACCEPTED)
 async def submit_job(body: SubmitJobRequest, request: Request) -> SubmitJobResponse:
     """Enqueue a job, awaiting upload for HTTP transfers."""
+    from training.policy_catalog import available_policy_classes, missing_policy_dependencies
+
+    if body.spec.policy not in available_policy_classes():
+        missing = missing_policy_dependencies(body.spec.policy)
+        detail = (
+            f"Policy {body.spec.policy!r} is missing: {', '.join(missing)}"
+            if missing
+            else f"Policy {body.spec.policy!r} is unavailable on this trainer"
+        )
+        raise HTTPException(status_code=422, detail=detail)
     manager = _manager(request)
     job_id = manager.store.create(body)
+    manager.store.stash_secret(job_id, body.hf_token)
     state = manager.store.get(job_id)
     job_status = state.status if state is not None else TrainerJobStatus.QUEUED
     return SubmitJobResponse(remote_job_id=job_id, status=job_status)
@@ -226,7 +237,7 @@ async def upload_dataset(job_id: HttpDatasetJob, request: Request, response: Res
             response.headers["Upload-Offset"] = str(next_offset)
             if next_offset < total:
                 return state
-        await asyncio.to_thread(_validate_and_extract, archive_path, target_dir)
+        await asyncio.to_thread(validate_and_extract, archive_path, target_dir)
         completed_upload = True
     except (ZipBombDetectedError, InvalidArchiveError) as exc:
         _cleanup_upload(archive_path, target_dir)
@@ -292,6 +303,57 @@ async def job_events(job_id: ResolvedJob, request: Request) -> EventSourceRespon
             await asyncio.sleep(1.0)
 
     return EventSourceResponse(_event_stream())
+
+
+@router.get("/{job_id}/metrics")
+async def job_metrics(job_id: ResolvedJob, request: Request) -> EventSourceResponse:
+    """Stream Lightning CSV metrics while a remote job is running."""
+    manager = job_id.manager
+    cache_path = get_settings().storage_dir / "cache" / job_id.id / "version_0" / "metrics.csv"
+    model_path = get_settings().models_dir / job_id.id / "version_0" / "metrics.csv"
+
+    async def _metric_stream():
+        path = cache_path
+        while not path.exists():
+            if await request.is_disconnected():
+                return
+            state = manager.store.get(job_id.id)
+            if state is None or state.status in _TERMINAL:
+                # A completed run moves the cache into the model directory.
+                if model_path.exists():
+                    path = model_path
+                    break
+                return
+            await asyncio.sleep(0.5)
+
+        async with await anyio.open_file(path, encoding="utf-8") as metrics_file:
+            header_line = ""
+            while not header_line:
+                if await request.is_disconnected():
+                    return
+                header_line = await metrics_file.readline()
+                if header_line:
+                    break
+                state = manager.store.get(job_id.id)
+                if state is None or state.status in _TERMINAL:
+                    return
+                await asyncio.sleep(0.5)
+            headers = [header.replace("/", "_") for header in next(csv.reader([header_line]))]
+            while True:
+                if await request.is_disconnected():
+                    return
+                line = await metrics_file.readline()
+                if line:
+                    row = next(csv.reader([line]))
+                    data = {key: _parse_metric_value(value) for key, value in zip(headers, row, strict=False)}
+                    yield ServerSentEvent(data=json.dumps(data))
+                    continue
+                state = manager.store.get(job_id.id)
+                if state is None or state.status in _TERMINAL:
+                    return
+                await asyncio.sleep(0.5)
+
+    return EventSourceResponse(_metric_stream())
 
 
 @router.get("/{job_id}/artifact")

@@ -4,13 +4,16 @@
 """Service for querying system hardware information."""
 
 import os
+from functools import lru_cache
 from importlib import import_module
 from typing import Any
 
 import torch
 from loguru import logger
 
+from internal_datasets.lerobot.video_encoding_settings import available_video_encoding_presets
 from schemas.hardware import DeviceInfo, DeviceType, InferenceBackend, InferenceDeviceInfo, TrainingDevices
+from schemas.video_recording import VideoRecordingPreset, VideoRecordingPresets
 
 
 class SystemService:
@@ -27,6 +30,16 @@ class SystemService:
         devices = cls._get_torch_inference_devices()
         devices.extend(cls._get_openvino_inference_devices())
         return devices
+
+    @staticmethod
+    def get_video_recording_presets() -> VideoRecordingPresets:
+        """Return recording presets that can encode a real frame on this backend."""
+        return VideoRecordingPresets(
+            presets=[
+                VideoRecordingPreset(id=preset.id, name=preset.name, description=preset.description)
+                for preset in available_video_encoding_presets()
+            ]
+        )
 
     @classmethod
     def _get_torch_inference_devices(cls) -> list[InferenceDeviceInfo]:
@@ -73,16 +86,31 @@ class SystemService:
 
         return devices
 
-    @classmethod
-    def _get_openvino_inference_devices(cls) -> list[InferenceDeviceInfo]:
-        """Get compute devices available to the OpenVINO backend for inference."""
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _get_openvino_core() -> Any | None:
+        """Return a process-wide OpenVINO ``Core``, or None when OpenVINO is unavailable.
+
+        The Core is cached deliberately: enumerating devices instantiates every registered
+        OpenVINO plugin, and the NPU plugin calls Level Zero's ``zeInitDrivers()``. On hosts
+        with no Level Zero driver installed, ``zeInitDrivers()`` returns UNINITIALIZED on the
+        first call and segfaults on any later one, so a second Core enumeration would take the
+        whole process down. Building the Core once keeps that call to a single invocation.
+        """
         try:
             openvino = import_module("openvino")
         except ImportError:
             logger.debug("OpenVINO is not installed; skipping OpenVINO inference devices.")
+            return None
+        return openvino.Core()
+
+    @classmethod
+    def _get_openvino_inference_devices(cls) -> list[InferenceDeviceInfo]:
+        """Get compute devices available to the OpenVINO backend for inference."""
+        core = cls._get_openvino_core()
+        if core is None:
             return []
 
-        core = openvino.Core()
         system_memory = cls._get_system_memory()
         devices: list[InferenceDeviceInfo] = [
             InferenceDeviceInfo(

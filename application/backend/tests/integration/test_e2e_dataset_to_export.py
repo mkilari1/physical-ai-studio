@@ -11,8 +11,8 @@ Background workers normally run as separate `multiprocessing.Process`es
 (`core.scheduler.Scheduler`). Spawning real processes per test is slow and
 hard to synchronize, so this test instantiates `TrainingWorker` /
 `DatasetImportWorker` directly and drives their per-job methods in-process -
-the same production code path, just called synchronously instead of polled
-from an infinite loop. See `docs/development/e2e-integration-testing-plan.md`.
+the same production code path, just called synchronously instead of launched
+in a child process. See `docs/development/e2e-integration-testing-plan.md`.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from fastapi.testclient import TestClient
 from api.dependencies import get_scheduler
 from main import app
 from schemas.base_job import JobStatus
-from schemas.job import TrainJobPayload
+from schemas.job import LocalTrainJobPayload, TrainJobPayloadAdapter
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
@@ -49,7 +49,7 @@ def _run_dataset_import_job_step() -> None:
         async with get_async_db_session_ctx() as session:
             job = await DatasetImportService(session).claim_pending_dataset_import_job()
         assert isinstance(job, DatasetImportJob), "Expected a pending dataset import job"
-        worker = DatasetImportWorker(stop_event=mp.Event(), event_queue=mp.Queue())
+        worker = DatasetImportWorker(job_id=job.id, stop_event=mp.Event(), event_queue=mp.Queue())
         await worker._process_job(job)
 
     asyncio.run(_drain())
@@ -58,8 +58,7 @@ def _run_dataset_import_job_step() -> None:
 def _run_training_job_step() -> None:
     """Claim and run exactly one pending training job to completion, in-process.
 
-    Mirrors the body of `TrainingWorker.run_loop` for a single iteration
-    instead of running the (otherwise infinite) polling loop.
+    Runs the training implementation directly without launching a child process.
     """
     import asyncio
 
@@ -75,7 +74,7 @@ def _run_training_job_step() -> None:
         async with get_async_db_session_ctx() as session:
             job = await JobService(session).get_pending_train_job()
         assert job is not None, "Expected a pending training job"
-        payload = TrainJobPayload.model_validate(job.payload)
+        payload = TrainJobPayloadAdapter.validate_python(job.payload)
 
         settings = get_settings()
         model_id = uuid4()
@@ -83,7 +82,7 @@ def _run_training_job_step() -> None:
 
         async with get_async_db_session_ctx() as session:
             dataset = await DatasetService(session).get_dataset_by_id(payload.dataset_id)
-        snapshot_dir = settings.snapshot_dir / SnapshotService.generate_snapshot_folder_name()
+        snapshot_dir = settings.snapshot_dir / SnapshotService.generate_snapshot_folder_name(job.id)
         async with get_async_db_session_ctx() as session:
             snapshot = await SnapshotService(session).create_snapshot_for_dataset(dataset, destination=snapshot_dir)
         payload.snapshot_id = snapshot.id
@@ -103,7 +102,7 @@ def _run_training_job_step() -> None:
             created_at=None,
         )
 
-        worker = TrainingWorker(stop_event=mp.Event(), job_interrupt_flags={}, event_queue=mp.Queue())
+        worker = TrainingWorker(job_id=job.id, stop_event=mp.Event(), cancel_event=mp.Event(), event_queue=mp.Queue())
         await worker._train_model(job, model, snapshot, payload)
 
     asyncio.run(_drain())
@@ -279,15 +278,15 @@ def test_submit_training_job_for_missing_project_returns_404(migrated_db: None) 
     assert response.status_code == 404, response.text
 
 
-def test_interrupt_job_marks_job_canceled(migrated_db: None) -> None:
-    """POST /api/jobs/{id}:interrupt flips a running job to CANCELED.
+def test_interrupt_job_waits_for_worker_before_deletion(migrated_db: None) -> None:
+    """Stop signals the worker; Delete waits until the worker confirms cancellation.
 
     Overrides `get_scheduler` with a minimal stand-in instead of running the
     real `Scheduler` (which needs the FastAPI lifespan to populate
     `app.state.scheduler`, and spins up real background worker processes).
     """
     import asyncio
-    from types import SimpleNamespace
+    from unittest.mock import MagicMock
 
     # submit_train_job requires a real project row (FK constraint), so create
     # one directly rather than pointing the job at a fake project id.
@@ -303,7 +302,7 @@ def test_interrupt_job_marks_job_canceled(migrated_db: None) -> None:
         async with get_async_db_session_ctx() as session:
             job_service = JobService(session)
             job = await job_service.submit_train_job(
-                TrainJobPayload(
+                LocalTrainJobPayload(
                     project_id=project_id,
                     dataset_id=uuid4(),
                     policy="act",
@@ -316,7 +315,7 @@ def test_interrupt_job_marks_job_canceled(migrated_db: None) -> None:
 
     job_id = asyncio.run(_submit_and_run(project_id))
 
-    fake_scheduler = SimpleNamespace(job_interrupt_flags={})
+    fake_scheduler = MagicMock()
     app.dependency_overrides[get_scheduler] = lambda: fake_scheduler
     try:
         response = client.post(f"/api/jobs/{job_id}:interrupt")
@@ -324,8 +323,21 @@ def test_interrupt_job_marks_job_canceled(migrated_db: None) -> None:
     finally:
         app.dependency_overrides.clear()
 
-    assert fake_scheduler.job_interrupt_flags[job_id] is True
+    fake_scheduler.cancel_job.assert_called_once_with(UUID(job_id))
 
     response = client.get(f"/api/jobs/{job_id}")
     assert response.status_code == 200, response.text
-    assert response.json()["status"] == JobStatus.CANCELED
+    assert response.json()["status"] == JobStatus.RUNNING
+    response = client.delete(f"/api/jobs/{job_id}")
+    assert response.status_code == 409, response.text
+
+    async def _worker_finishes_stop() -> None:
+        from db import get_async_db_session_ctx
+        from services.job_service import JobService
+
+        async with get_async_db_session_ctx() as session:
+            await JobService(session).update_job_status(UUID(job_id), status=JobStatus.CANCELED)
+
+    asyncio.run(_worker_finishes_stop())
+    response = client.delete(f"/api/jobs/{job_id}")
+    assert response.status_code == 200, response.text

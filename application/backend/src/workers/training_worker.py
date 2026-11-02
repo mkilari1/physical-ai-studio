@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import datetime
 import multiprocessing as mp
 from pathlib import Path
@@ -15,8 +14,10 @@ from loguru import logger
 from core.logging.utils import job_logging_ctx
 from db import get_async_db_session_ctx
 from schemas import Job, Model, Snapshot
+from schemas.aws_auth import AwsAuthenticationIssue
 from schemas.base_job import JobStatus
-from schemas.job import TrainingTarget, TrainJobPayload
+from schemas.job import RemoteTrainJobPayload, TrainingTarget, TrainJobPayload, TrainJobPayloadAdapter
+from schemas.model import DORA_PROPERTY, LORA_PROPERTY, SNAPFLOW_PROPERTY
 from services import DatasetService, ModelService
 from services.event_processor import EventType
 from services.job_service import JobService
@@ -28,76 +29,41 @@ from services.training_backends import (
     TrainingSuspendedError,
     get_training_backend,
 )
-from services.training_service import TrainingService, TrainingTrackingDispatcher
+from services.training_service import TrainingTrackingDispatcher
 from settings import get_settings
 from workers.base import BaseProcessWorker
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from multiprocessing.managers import DictProxy
     from multiprocessing.synchronize import Event as EventClass
-
-SCHEDULE_INTERVAL_SEC = 5
 
 
 class TrainingWorker(BaseProcessWorker):
     ROLE = "TrainingWorker"
 
-    def __init__(self, stop_event: EventClass, job_interrupt_flags: DictProxy, event_queue: mp.Queue):
+    def __init__(self, job_id: UUID, stop_event: EventClass, cancel_event: EventClass, event_queue: mp.Queue):
         super().__init__(stop_event=stop_event)
+        self.job_id = job_id
         self.queue = event_queue
-        # Shared per-job interrupt flags (job id str -> True). Concurrent jobs on
-        # different targets each read/clear only their own entry, so cancelling
-        # one job cannot cross-cancel another running job.
-        self.job_interrupt_flags = job_interrupt_flags
-        self._active_training_tasks: dict[str, asyncio.Task[None]] = {}
+        self.cancel_event = cancel_event
 
     async def run_loop(self) -> None:
-        logger.info("Training Worker is running")
-        try:
-            while not self.should_stop():
-                async with get_async_db_session_ctx() as session:
-                    pending_jobs = await JobService(session, RemoteTrainerService(session)).get_pending_train_jobs()
-                for job in pending_jobs:
-                    payload = TrainJobPayload.model_validate(job.payload)
-                    target = self._target_key(payload)
-                    if target in self._active_training_tasks:
-                        continue
-                    task = asyncio.create_task(self._run_training_job(job, payload), name=f"training-{job.id}")
-                    self._active_training_tasks[target] = task
-                    task.add_done_callback(self._make_release_callback(target, job.id))
-                self.stop_aware_sleep(0.5)
-        finally:
-            if self._active_training_tasks:
-                await asyncio.gather(*self._active_training_tasks.values(), return_exceptions=True)
-
-    def _release_target(self, target: str, job_id: UUID, completed_task: asyncio.Task[None]) -> None:
-        """Release a target only when its currently registered task completes."""
-        if self._active_training_tasks.get(target) is completed_task:
-            self._active_training_tasks.pop(target)
-        self.job_interrupt_flags.pop(str(job_id), None)
-
-    def _make_release_callback(self, target: str, job_id: UUID) -> Callable[[asyncio.Task[None]], None]:
-        """Build a done-callback bound to `target`/`job_id` for `add_done_callback`."""
-
-        def _on_done(completed_task: asyncio.Task[None]) -> None:
-            self._release_target(target, job_id, completed_task)
-
-        return _on_done
-
-    @staticmethod
-    def _target_key(payload: TrainJobPayload) -> str:
-        """Return the exclusive execution target for a training job."""
-        if payload.training_target is TrainingTarget.LOCAL:
-            return TrainingTarget.LOCAL.value
-        return f"{TrainingTarget.REMOTE.value}:{payload.remote_trainer_id}"
+        """Execute only the job assigned by the scheduler, then exit."""
+        if self.should_stop():
+            return
+        async with get_async_db_session_ctx() as session:
+            job = await JobService(session, RemoteTrainerService(session)).claim_pending_train_job(self.job_id)
+        if job is not None:
+            await self._run_training_job(job, TrainJobPayloadAdapter.validate_python(job.payload))
 
     async def _run_training_job(self, job: Job, payload: TrainJobPayload) -> None:
         """Prepare and execute one job after its execution target has been reserved."""
         with job_logging_ctx(job_id=str(job.id)):
             settings = get_settings()
             model_id = uuid4()
-            reattaching = payload.training_target is TrainingTarget.REMOTE and bool(payload.remote_job_id)
+            # Both remote kinds keep their trainer running independently of the
+            # studio process, so either can carry a persisted remote_job_id to
+            # reattach to across a restart; only local training never does.
+            reattaching = payload.training_target is not TrainingTarget.LOCAL and bool(payload.remote_job_id)
 
             base_model = None
             if payload.base_model_id is not None:
@@ -112,7 +78,7 @@ class TrainingWorker(BaseProcessWorker):
             else:
                 async with get_async_db_session_ctx() as session:
                     dataset = await DatasetService(session).get_dataset_by_id(payload.dataset_id)
-                snapshot_dir = settings.snapshot_dir / SnapshotService.generate_snapshot_folder_name()
+                snapshot_dir = settings.snapshot_dir / SnapshotService.generate_snapshot_folder_name(job.id)
                 async with get_async_db_session_ctx() as session:
                     snapshot = await SnapshotService(session).create_snapshot_for_dataset(
                         dataset, destination=snapshot_dir
@@ -128,28 +94,17 @@ class TrainingWorker(BaseProcessWorker):
                 name=payload.model_name,
                 snapshot_id=snapshot_id,
                 policy=payload.policy,
-                properties={},
+                properties={
+                    LORA_PROPERTY: payload.lora_enabled,
+                    DORA_PROPERTY: payload.lora_use_dora,
+                    SNAPFLOW_PROPERTY: payload.snapflow_enabled,
+                },
                 train_job_id=job.id,
                 parent_model_id=payload.base_model_id,
                 version=base_model.version + 1 if base_model else 1,
                 created_at=None,
             )
             await self._train_model(job, model, snapshot, payload, base_model)
-
-    async def setup(self) -> None:
-        await super().setup()
-        with logger.contextualize(worker=self.__class__.__name__):
-            await self._abort_orphan_jobs()
-
-    async def teardown(self) -> None:
-        await super().teardown()
-        with logger.contextualize(worker=self.__class__.__name__):
-            await self._abort_orphan_jobs()
-
-    @staticmethod
-    async def _abort_orphan_jobs() -> None:
-        async with get_async_db_session_ctx() as session:
-            await TrainingService.abort_orphan_jobs(JobService(session, RemoteTrainerService(session)))
 
     @staticmethod
     async def _update_training_progress(
@@ -180,7 +135,7 @@ class TrainingWorker(BaseProcessWorker):
                 update={
                     "status": JobStatus.RUNNING,
                     "message": "Training started",
-                    "start_time": datetime.datetime.now(tz=datetime.UTC),
+                    "start_time": job.start_time or datetime.datetime.now(tz=datetime.UTC),
                 },
             )
         dispatcher = TrainingTrackingDispatcher(
@@ -203,18 +158,26 @@ class TrainingWorker(BaseProcessWorker):
                 output_dir=Path(model.path),
                 cache_dir=settings.cache_dir / str(job.id),
                 progress=dispatcher.report,
-                should_stop=lambda: self._should_interrupt(job.id),
+                should_stop=self._should_interrupt,
                 remote_job_id=payload.remote_job_id,
                 on_remote_job_id=lambda remote_job_id: self._persist_remote_job_id(job, payload, remote_job_id),
                 should_suspend=self.should_stop,
-                should_cancel_job=lambda: bool(self.job_interrupt_flags.get(str(job.id), False)),
+                should_cancel_job=lambda: (
+                    self.cancel_event.is_set() or bool(getattr(payload, "cancel_requested", False))
+                ),
+                on_authentication_issue=lambda issue: self._report_authentication_issue(job.id, payload, issue),
             )
 
-            backend = get_training_backend(payload)
+            # A reattached remote job still needs its backend to cancel the remote execution.
+            if self.cancel_event.is_set() and (
+                payload.training_target is TrainingTarget.LOCAL or not payload.remote_job_id
+            ):
+                raise TrainingCanceledError("Training canceled during preparation")
+            backend = await get_training_backend(payload)
             await backend.train(context)
             # The local backend stops cooperatively without raising; treat a
             # completed-but-interrupted run as a cancellation, not a success.
-            interrupted = self._should_interrupt(job.id)
+            interrupted = self._should_interrupt()
         except TrainingSuspendedError:
             # Leave the remote job running so a restart can reattach.
             suspended = True
@@ -268,9 +231,31 @@ class TrainingWorker(BaseProcessWorker):
         """Persist the remote job id for restart recovery."""
         payload.remote_job_id = remote_job_id
         async with get_async_db_session_ctx() as session:
-            await JobService(session, RemoteTrainerService(session)).update_job_payload(job.id, payload)
+            service = JobService(session, RemoteTrainerService(session))
+            if (
+                isinstance(payload, RemoteTrainJobPayload)
+                and payload.remote_trainer_url
+                and payload.remote_trainer_url.startswith("aws-batch://")
+            ):
+                await service.update_remote_job_state(
+                    job.id, remote_job_id=remote_job_id, snapshot_id=payload.snapshot_id
+                )
+            else:
+                await service.update_job_payload(job.id, payload)
         logger.info("Persisted remote job id {} for restart recovery", remote_job_id)
 
-    def _should_interrupt(self, job_id: UUID) -> bool:
-        """Stop training on global shutdown or an interrupt requested for this job."""
-        return self.should_stop() or bool(self.job_interrupt_flags.get(str(job_id), False))
+    async def _report_authentication_issue(
+        self, job_id: UUID, payload: TrainJobPayload, issue: AwsAuthenticationIssue | None
+    ) -> None:
+        if not isinstance(payload, RemoteTrainJobPayload):
+            raise ValueError("AWS authentication requires a remote training payload")
+        payload.authentication_issue = issue
+        async with get_async_db_session_ctx() as session:
+            job = await JobService(session, RemoteTrainerService(session)).update_remote_job_state(
+                job_id, authentication_issue=issue
+            )
+        self.queue.put((EventType.JOB_UPDATE, job))
+
+    def _should_interrupt(self) -> bool:
+        """Stop training on global shutdown or this job's cancellation event."""
+        return self.should_stop() or self.cancel_event.is_set()

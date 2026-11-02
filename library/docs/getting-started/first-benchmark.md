@@ -86,7 +86,7 @@ AGGREGATE METRICS:
   Success Rate: XX.X%
   Avg Reward: X.XXXX
   Avg Episode Length: XXX.X
-  Avg FPS: XX.X
+  Avg gym speed: XX.X
 
 PER-TASK RESULTS:
   libero_10_0: success=XX.X%, reward=X.XXXX, steps=XXX.X
@@ -103,7 +103,7 @@ PER-TASK RESULTS:
 | **Success Rate**       | % of episodes where the task was completed  |
 | **Avg Reward**         | Average cumulative reward across episodes   |
 | **Avg Episode Length** | Average number of steps per episode         |
-| **Avg FPS**            | Average frames per second during evaluation |
+| **Avg gym speed**      | Average env steps per second (policy + sim) |
 
 ### Save Results
 
@@ -163,6 +163,43 @@ from physicalai.benchmark.gyms import PushTBenchmark
 benchmark = PushTBenchmark(num_episodes=50)
 results = benchmark.evaluate(policy)
 ```
+
+## RoboCasa (Kitchen)
+
+Kitchen manipulation benchmark. RoboCasa requires a dedicated virtual environment because its dependencies conflict with the main library. Do not use `uv sync --extra all` or `uv sync --extra libero` for this environment.
+
+**Prerequisites:**
+
+```bash
+uv venv .venv-robocasa
+source .venv-robocasa/bin/activate
+uv sync --active --extra cu128          # or cpu / xpu
+
+bash library/scripts/benchmark/install_robocasa.sh
+
+# Download kitchen assets (~4.4 GB on disk; prompts interactively)
+yes y | python -m robocasa.scripts.download_kitchen_assets \
+    --type tex tex_generative fixtures_lw objs_lw
+
+# Headless servers
+export MUJOCO_GL=egl
+```
+
+**Python API:**
+
+```python test="skip" reason="requires robocasa dedicated venv"
+from physicalai.benchmark.gyms import RoboCasaBenchmark
+from physicalai.policies import Rldx1
+
+policy = Rldx1(pretrained_name_or_path="RLWRLD/RLDX-1-FT-ROBOCASA")
+policy.eval()
+
+benchmark = RoboCasaBenchmark(task="atomic_seen", num_episodes=20)
+results = benchmark.evaluate(policy)
+print(results.summary())
+```
+
+See [RoboCasa explanation](../explanation/gyms/robocasa.md) for details on the dedicated venv and dependency conflicts.
 
 ## Quick Test Run
 

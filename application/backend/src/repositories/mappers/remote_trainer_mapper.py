@@ -12,7 +12,8 @@ class RemoteTrainerMapper(IBaseMapper):
         return RemoteTrainerDB(
             id=str(db_schema.id),
             name=db_schema.name,
-            url=str(db_schema.url),
+            connection_mode=db_schema.connection.connection_mode.value,
+            connection=db_schema.connection.model_dump(mode="json"),
         )
 
     @staticmethod
@@ -22,7 +23,7 @@ class RemoteTrainerMapper(IBaseMapper):
             {
                 "id": model.id,
                 "name": model.name,
-                "url": model.url,
+                "connection": model.connection,
                 "created_at": model.created_at,
                 "updated_at": model.updated_at,
             }

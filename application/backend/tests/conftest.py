@@ -4,6 +4,8 @@ import os
 import shutil
 import tempfile
 
+os.environ.setdefault("AWS_ENABLED", "true")
+
 # Isolate the test session from the developer's real Studio storage/database.
 #
 # `db/engine.py` builds its SQLAlchemy engines from `settings.get_settings()` at
@@ -21,12 +23,11 @@ if _STORAGE_DIR_CREATED:
     _TEST_STORAGE_DIR = tempfile.mkdtemp(prefix="physicalai-backend-tests-")
     os.environ["STORAGE_DIR"] = _TEST_STORAGE_DIR
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
-from robots.robot_client import RobotClient
 from robots.robot_client_factory import RobotClientFactory
 from schemas.dataset import Dataset
 from schemas.environment import EnvironmentWithRelations
@@ -41,38 +42,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
 
 @pytest.fixture
-def mock_robot_client():
-    client = MagicMock(spec=RobotClient)
-    client.features.return_value = [
-        "shoulder_pan.pos",
-        "shoulder_lift.pos",
-        "elbow_flex.pos",
-        "wrist_flex.pos",
-        "wrist_roll.pos",
-        "gripper.pos",
-    ]
-    client.connect = MagicMock()
-    client.disconnect = MagicMock()
-    client.read_state = MagicMock(
-        return_value={
-            "state": {
-                "shoulder_pan.pos": -8.705526116578355,
-                "shoulder_lift.pos": -98.16753926701571,
-                "elbow_flex.pos": 95.98393574297188,
-                "wrist_flex.pos": 73.85993485342019,
-                "wrist_roll.pos": -13.84615384615384,
-                "gripper.pos": 26.885644768856448,
-            }
-        }
-    )
-    return client
-
-
-@pytest.fixture
-def mock_robot_client_factory(mock_robot_client):
-    factory = MagicMock(spec=RobotClientFactory)
-    factory.build = AsyncMock(return_value=mock_robot_client)
-    return factory
+def mock_robot_client_factory():
+    return MagicMock(spec=RobotClientFactory)
 
 
 @pytest.fixture
@@ -100,7 +71,7 @@ def test_environment():
                     "id": "3ed60255-04ae-407b-8e2c-c3281847a4e0",
                     "driver": "usb_camera",
                     "name": "grabber",
-                    "fingerprint": "/dev/video0:0",
+                    "fingerprint": {"path": "/dev/video0:0"},
                     "hardware_name": None,
                     "payload": {"width": 640, "height": 480, "fps": 30},
                 },
@@ -108,7 +79,7 @@ def test_environment():
                     "id": "4629e172-2aa7-4fde-86b1-e19eb1d210ff",
                     "driver": "usb_camera",
                     "name": "front",
-                    "fingerprint": "/dev/video6:6",
+                    "fingerprint": {"path": "/dev/video6:6"},
                     "hardware_name": None,
                     "payload": {"width": 640, "height": 480, "fps": 30},
                 },

@@ -62,7 +62,6 @@ x-common-build: &common-build
     dockerfile: application/docker/Dockerfile.trainer
     additional_contexts:
       libs: ../../library
-      plugin: ../../application/plugin
     args:
       - HTTP_PROXY=${HTTP_PROXY}
       - HTTPS_PROXY=${HTTPS_PROXY}
@@ -98,16 +97,10 @@ services:
       target: physicalai-trainer-xpu
     devices:
       - "${RENDER_NODE:-/dev/dri/renderD128}:${RENDER_NODE:-/dev/dri/renderD128}"
+    # No "render" group exists in this image, so the fallback fails fast at
+    # container start (not at parse time) if RENDER_GID isn't set.
     group_add:
-      - "${RENDER_GID:?RENDER_GID must be set to the host's render node GID; see .env.trainer.example}"
-    volumes:
-      - physicalai-trainer-data:/var/lib/physicalai-trainer
-      # VLA-JEPA: live-mount policy code so changes take effect without rebuild
-      - /home/devcloud/munikera/physical-ai-studio/library:/app/library:ro
-      # Model checkpoints
-      - /home/devcloud/munikera/checkpoints:/checkpoints:ro
-      # Physical AI Studio datasets from the studio storage volume
-      - /var/lib/docker/volumes/docker_physical-ai-studio-storage/_data/datasets:/app/datasets:ro
+      - "${RENDER_GID:-render}"
     environment:
       - HF_TOKEN=${HF_TOKEN}
       - HTTP_PROXY=${HTTP_PROXY}
@@ -116,7 +109,7 @@ services:
       - http_proxy=${http_proxy}
       - https_proxy=${https_proxy}
       - no_proxy=${no_proxy}
-      - ZE_AFFINITY_MASK=0
+      - ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-0}
       - SYCL_CACHE_PERSISTENT=1
       - SYCL_UR_USE_LEVEL_ZERO_V2=0
 

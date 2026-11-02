@@ -1,8 +1,19 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from schemas.hardware import DeviceType, InferenceBackend
+from schemas.video_recording import VideoRecordingPreset
 from services.system_service import SystemService
+
+
+@pytest.fixture(autouse=True)
+def _reset_openvino_core_cache():
+    """Reset the process-wide OpenVINO Core cache so each test sees its own mock."""
+    SystemService._get_openvino_core.cache_clear()
+    yield
+    SystemService._get_openvino_core.cache_clear()
 
 
 def _device_props(name: str, total_memory: int) -> SimpleNamespace:
@@ -122,3 +133,17 @@ def test_get_available_training_devices_returns_studio_host_devices() -> None:
     assert result.mode == "local"
     assert result.remote_available is True
     assert result.devices == local_devices
+
+
+def test_get_video_recording_presets_returns_discovered_presets() -> None:
+    presets = [
+        SimpleNamespace(id="intel-qsv-h264", name="Intel GPU QSV", description="Hardware encoding"),
+        SimpleNamespace(id="cpu-h264", name="CPU H.264", description="Software encoding"),
+    ]
+    with patch("services.system_service.available_video_encoding_presets", return_value=presets):
+        result = SystemService.get_video_recording_presets()
+
+    assert result.presets == [
+        VideoRecordingPreset(id="intel-qsv-h264", name="Intel GPU QSV", description="Hardware encoding"),
+        VideoRecordingPreset(id="cpu-h264", name="CPU H.264", description="Software encoding"),
+    ]

@@ -6,7 +6,6 @@
 # Project-specific hooks are defined in:
 #   - library/.pre-commit-config.yaml
 #   - application/backend/.pre-commit-config.yaml
-#   - application/plugin/.pre-commit-config.yaml (kept in sync with backend)
 #   - application/ui/.pre-commit-config.yaml
 
 default_language_version:
@@ -25,7 +24,8 @@ repos:
         exclude: ^(\.claude/skills/|\.agents/skills/)
       - id: check-yaml
       - id: check-added-large-files
-        exclude: uv\.lock$
+        # Generated README demo GIFs are intentionally larger than the generic limit.
+        exclude: ^docs/assets/readme/(api-demo|gui-demo)\.gif$|uv\.lock$
       - id: detect-private-key
       - id: check-merge-conflict
       - id: check-case-conflict

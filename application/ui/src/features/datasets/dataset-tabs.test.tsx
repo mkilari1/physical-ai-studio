@@ -1,7 +1,7 @@
+import { rs } from '@rstest/core';
 import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Tabs } from 'react-aria-components';
-import { describe, expect, it, vi } from 'vitest';
 
 import { SchemaDatasetOutput } from '../../api/openapi-spec';
 import { render } from '../../test-utils/render';
@@ -57,7 +57,7 @@ describe('DatasetTabs', () => {
 
     it('exports the selected dataset from its contextual menu', async () => {
         const user = userEvent.setup();
-        const open = vi.spyOn(window, 'open').mockImplementation(() => null);
+        const open = rs.spyOn(window, 'open').mockImplementation(() => null);
 
         renderDatasetTabs();
 
@@ -83,9 +83,9 @@ describe('DatasetTabs', () => {
         const user = userEvent.setup();
         renderDatasetTabs();
 
-        const addDatasetButton = await screen.findByRole('button', { name: 'Add dataset' });
-        await user.click(addDatasetButton);
+        const createDatasetButton = await screen.findByRole('button', { name: 'Create new dataset' });
+        await user.click(createDatasetButton);
 
-        expect(addDatasetButton).toHaveAttribute('aria-expanded', 'true');
+        expect(createDatasetButton).toHaveAttribute('aria-expanded', 'true');
     });
 });
